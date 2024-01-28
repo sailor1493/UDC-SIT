@@ -17,3 +17,9 @@ data/*
 !train_Feng.sh
 !test_SIT.sh
 !test_Feng.sh
+
+logs/
+logs
+
+*.sh
+*.sbatch

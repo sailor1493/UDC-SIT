@@ -19,6 +19,16 @@ from util import setup_img_save_function
 
 img_save_function = None
 
+def calculate_lfd_lpd(lq, gt):
+    fft_lq = torch.fft.fftn(lq, dim=(-2, -1))
+    fft_gt = torch.fft.fftn(gt, dim=(-2, -1))
+    
+    lfd_sum_vector = torch.pow(torch.abs(fft_lq - fft_gt), 2)
+    lfd_value = torch.log(lfd_sum_vector.mean() + 1)
+    lpd_sum_vector = torch.pow(torch.abs(torch.angle(fft_lq)-torch.angle(fft_gt)), 2)
+    lpd_value = torch.log(lpd_sum_vector.mean() + 1)
+    
+    return lfd_value, lpd_value
 
 def test(
     model: nn.Module,
@@ -27,13 +37,18 @@ def test(
     save_dir=None,
     experiment_name=None,
     logger=None,
+    data_itself=False,
 ):
     global img_save_function
     model.eval()
-    ddp_loss = torch.zeros(3).to(0)
+    ddp_loss = torch.zeros(5).to(0)
+    
+    if data_itself:
+        model = lambda x: x
 
     iter_bar = tqdm.tqdm(test_loader)
-    with torch.no_grad():
+    with torch.no_grad(), open(os.path.join(save_dir, "log.csv"), "w") as f:
+        f.write("IMG,PSNR,SSIM,LFD,LPD\n")
         for data, target, img_name in iter_bar:
             img_name = img_name[0].split(".")[0]
 
@@ -47,13 +62,19 @@ def test(
             ssim = structural_similarity_index_measure(output, target)
             ddp_loss[1] += ssim
             ddp_loss[2] += len(data)
+            
+            lfd, lpd = calculate_lfd_lpd(output, target)
+            ddp_loss[3] += lfd
+            ddp_loss[4] += lpd 
 
             if logger:
-                msg = f"Img name: {img_name}, PSNR: {psnr:.4f}, SSIM: {ssim:.4f}"
+                msg = f"Img: {img_name}, PSNR: {psnr:.4f}, SSIM: {ssim:.4f}, LFD: {lfd:.4f}, LPD: {lpd:.4f}"
                 logger.info(msg)
+            f.write(f"{img_name},{psnr:.4f},{ssim:.4f},{lfd:.4f},{lpd:.4f}\n")
+            f.flush()
 
             if save_image and save_dir is not None:
-                filename = f"{experiment_name}_{img_name}_{psnr:.4f}_{ssim:.4f}.png"
+                filename = f"{experiment_name}_{img_name}.png"
                 img_save_function(output, os.path.join(save_dir, filename))
     msg = f"Test set: Average PSNR: {ddp_loss[0] / ddp_loss[2]:.4f}, Average SSIM: {ddp_loss[1] / ddp_loss[2]:.4f}"
     if logger is not None:
@@ -72,6 +93,7 @@ def main():
     parser.add_argument("--test-GT", type=str, default="data/test/GT")
     parser.add_argument("--channels", type=int, default=3)
     parser.add_argument("--norm", type=str, required=True, choices=["norm", "tonemap"])
+    parser.add_argument("--data-itself", action="store_true")
     args = parser.parse_args()
 
     print("Creating test dataset...", end=" ", flush=True)
@@ -119,6 +141,7 @@ def main():
         save_dir=save_dir,
         experiment_name=args.name,
         logger=logger,
+        data_itself=args.data_itself,
     )
 
 

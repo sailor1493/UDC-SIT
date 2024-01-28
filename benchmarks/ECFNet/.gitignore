@@ -4,3 +4,9 @@ results/
 *.sh
 !train.sh
 !test.sh
+
+logs/
+logs
+
+*.sh
+*.sbatch

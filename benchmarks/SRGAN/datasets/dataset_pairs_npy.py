@@ -75,9 +75,11 @@ class my_dataset_eval(Dataset):
         # in_imgs
         in_files = os.listdir(root_in)
         self.imgs_in = [os.path.join(root_in, k) for k in in_files]
+        self.imgs_in.sort()
         # gt_imgs
         gt_files = os.listdir(root_label)
         self.imgs_gt = [os.path.join(root_label, k) for k in gt_files]
+        self.imgs_gt.sort()
 
         self.transform = transform
 
