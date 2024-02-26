@@ -437,6 +437,7 @@ def fsdp_main(rank, world_size, opt):
                 save_dir=save_dir_path,
                 wandb_base_epoch=wandb_base_epoch,
                 save_count=opt.save_img_count,
+                save_fn=save_fn,
             )
 
         if epoch % opt.save_interval == 0:

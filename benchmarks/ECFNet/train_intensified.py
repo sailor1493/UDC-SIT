@@ -33,7 +33,7 @@ from pathlib import Path
 
 import tqdm
 
-from networks.detachableECFNet import *
+from networks.intensifiedECFNet import *
 from datasets.dataset_pairs_npy import *
 from torchmetrics.functional import (
     peak_signal_noise_ratio,
@@ -62,6 +62,36 @@ def _interpolate_2(x):
     return [x, F.interpolate(x, scale_factor=0.5), F.interpolate(x, scale_factor=0.25)]
 
 
+def _interpolate_3(x):
+    return [
+        x,
+        F.interpolate(x, scale_factor=0.5),
+        F.interpolate(x, scale_factor=0.25),
+        F.interpolate(x, scale_factor=0.125),
+    ]
+
+
+def _interpolate_4(x):
+    return [
+        x,
+        F.interpolate(x, scale_factor=0.5),
+        F.interpolate(x, scale_factor=0.25),
+        F.interpolate(x, scale_factor=0.125),
+        F.interpolate(x, scale_factor=0.0625),
+    ]
+
+
+def _interpolate_5(x):
+    return [
+        x,
+        F.interpolate(x, scale_factor=0.5),
+        F.interpolate(x, scale_factor=0.25),
+        F.interpolate(x, scale_factor=0.125),
+        F.interpolate(x, scale_factor=0.0625),
+        F.interpolate(x, scale_factor=0.03125),
+    ]
+
+
 # def interpolate_down(x):
 #     x_2 = F.interpolate(x, scale_factor=0.5)  # 1, 4, 128, 128
 #     x_4 = F.interpolate(x_2, scale_factor=0.5)  # 1, 4, 64, 64
@@ -71,7 +101,7 @@ def _interpolate_2(x):
 
 def setup(rank, world_size):
     os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "12355"
+    # os.environ["MASTER_PORT"] = "12376"
 
     # initialize the process group
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
@@ -146,6 +176,14 @@ def train(
         interpolate_down = _interpolate_1
     elif level == 3:
         interpolate_down = _interpolate_2
+    elif level == 4:
+        interpolate_down = _interpolate_3
+    elif level == 5:
+        interpolate_down = _interpolate_4
+    elif level == 6:
+        interpolate_down = _interpolate_5
+    else:
+        raise ValueError(f"Level {level} not found")
     save_dir_path = f"experiments/{args.experiment_name}"
 
     if loss_function == "v1":
@@ -213,7 +251,6 @@ def test(
             if isinstance(output, list):
                 output = output[0]
 
-            img = output.clone()
             output = output * 255
             target = target * 255
             output = output.to(torch.uint8).to(torch.float32)
@@ -225,7 +262,7 @@ def test(
             # if save_image and save_dir is not None:
             if save:
                 save_fn(
-                    img,
+                    output,
                     os.path.join(epoch_dir, img_name[-1].replace(".npy", ".png")),
                 )
                 remaining -= 1
@@ -320,7 +357,7 @@ def fsdp_main(rank, world_size, opt):
     init_start_event = torch.cuda.Event(enable_timing=True)
     init_end_event = torch.cuda.Event(enable_timing=True)
 
-    model = DetachableECFNet(
+    model = IntensifiedECFNet(
         in_nc=opt.channels, out_nc=opt.channels, level=opt.level_ablation
     ).to(rank)
     # Activation Checkpoint Wrapper
@@ -329,12 +366,18 @@ def fsdp_main(rank, world_size, opt):
         check_fn = lambda m: isinstance(m, tuple(blocks))
         apply_activation_checkpointing(model, check_fn=check_fn)
 
+    precision = MixedPrecision(
+        param_dtype=torch.float16,
+        reduce_dtype=torch.float16,
+        buffer_dtype=torch.float16,
+    )
     model = FSDP(
         model,
         device_id=rank,
         sharding_strategy=ShardingStrategy.NO_SHARD,
-        backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
-        forward_prefetch=True,
+        backward_prefetch=BackwardPrefetch.BACKWARD_POST,
+        forward_prefetch=False,
+        # mixed_precision=precision,
         auto_wrap_policy=my_auto_wrap_policy,
     )
     print_root(rank, f"Created model")
@@ -503,7 +546,7 @@ def main():
     train_group.add_argument("--num-res", type=int, default=6)
     train_group.add_argument("--loss-version", type=str, default="v1")
     train_group.add_argument(
-        "--level-ablation", type=int, required=True, choices=[1, 2, 3]
+        "--level-ablation", type=int, required=True, choices=[1, 2, 3, 4, 5, 6]
     )
 
     trainer_group = parser.add_argument_group("Trainer Options")
