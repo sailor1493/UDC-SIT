@@ -33,14 +33,13 @@ from pathlib import Path
 
 import tqdm
 
-from networks.ECFNet import *
+from networks.detachableECFNet import *
 from datasets.dataset_pairs_npy import *
 from torchmetrics.functional import (
     peak_signal_noise_ratio,
     structural_similarity_index_measure,
 )
 import numpy as np
-from utils import setup_img_save_function
 from PIL import Image
 import wandb
 
@@ -76,11 +75,23 @@ def print_root(rank, msg):
         print(msg)
 
 
-def interpolate_down(x):
-    x_2 = F.interpolate(x, scale_factor=0.5)  # 1, 4, 128, 128
-    x_4 = F.interpolate(x_2, scale_factor=0.5)  # 1, 4, 64, 64
-    x_8 = F.interpolate(x_4, scale_factor=0.5)  # 1, 4, 32, 32
-    return [x_8, x_4, x_2, x]
+def _interpolate_0(x):
+    return [x]
+
+
+def _interpolate_1(x):
+    return [x, F.interpolate(x, scale_factor=0.5)]
+
+
+def _interpolate_2(x):
+    return [x, F.interpolate(x, scale_factor=0.5), F.interpolate(x, scale_factor=0.25)]
+
+
+# def interpolate_down(x):
+#     x_2 = F.interpolate(x, scale_factor=0.5)  # 1, 4, 128, 128
+#     x_4 = F.interpolate(x_2, scale_factor=0.5)  # 1, 4, 64, 64
+#     x_8 = F.interpolate(x_4, scale_factor=0.5)  # 1, 4, 32, 32
+#     return [x_8, x_4, x_2, x]
 
 
 def setup(rank, world_size):
@@ -128,23 +139,11 @@ def ecfnet_loss_v3(lq, gt, ratio=0.5, eps=1e-8):
     return charbonnier_loss + ratio * fft_abs
 
 
-def charbonnier_only(lq, gt, ratio=0.5, eps=1e-8):
-    return torch.sqrt(torch.mean((lq - gt) ** 2) + eps)
-
-
 def ensemble_loss(lqs, gts, ratio=0.5, eps=1e-12, fn=ecfnet_loss):
     loss = 0
     for lq, gt in zip(lqs, gts):
         loss += fn(lq, gt, ratio, eps)
     return loss
-
-
-loss_fn_map = {
-    "v1": ecfnet_loss,
-    "v2": ecfnet_loss_v2,
-    "v3": ecfnet_loss_v3,
-    "charbonnier": charbonnier_only,
-}
 
 
 def train(
@@ -157,16 +156,30 @@ def train(
     epoch,
     loss_lambda=0.5,
     sampler=None,
+    level=3,
     loss_function="v1",
+    wandb_base_epoch=0,
 ):
     model.train()
     ddp_loss = torch.zeros(2).to(rank)
+
     if sampler:
         sampler.set_epoch(epoch)
+    if level == 1:
+        interpolate_down = _interpolate_0
+    elif level == 2:
+        interpolate_down = _interpolate_1
+    elif level == 3:
+        interpolate_down = _interpolate_2
     save_dir_path = f"experiments/{args.experiment_name}"
 
-    loss_fn = loss_fn_map.get(loss_function, None)
-    if loss_fn is None:
+    if loss_function == "v1":
+        loss_fn = ecfnet_loss
+    elif loss_function == "v2":
+        loss_fn = ecfnet_loss_v2
+    elif loss_function == "v3":
+        loss_fn = ecfnet_loss_v3
+    else:
         raise ValueError(f"Loss function {loss_function} not found")
 
     train_bar = tqdm.tqdm(train_loader) if rank == 0 else train_loader
@@ -187,7 +200,7 @@ def train(
     if rank == 0:
         avg_loss = ddp_loss[0] / ddp_loss[1]
         msg = "Train Epoch: {} \tLoss: {:.6f}".format(epoch, avg_loss)
-        wandb.log({"train loss": avg_loss}, step=epoch)
+        wandb.log({"train loss": avg_loss}, step=epoch + wandb_base_epoch)
         print(msg)
         with open(os.path.join(save_dir_path, f"train.log"), "a") as f:
             f.write(f"Epoch {epoch}: {msg}\n")
@@ -204,7 +217,7 @@ def test(
     save_image=False,
     save_dir=None,
     epoch=None,
-    save_fn=save_3ch_npy_to_img,
+    wandb_base_epoch=0,
 ):
     model.eval()
     ddp_loss = torch.zeros(3).to(rank)
@@ -219,15 +232,19 @@ def test(
             output = model(data)
             # if ouptut is list, take only the last one
             if isinstance(output, list):
-                output = output[-1]
+                output = output[0]
+
+            output = output * 255
+            target = target * 255
+            output = output.to(torch.uint8).to(torch.float32)
+            target = target.to(torch.uint8).to(torch.float32)
+
             ddp_loss[0] += peak_signal_noise_ratio(output, target)
             ddp_loss[1] += structural_similarity_index_measure(output, target)
             ddp_loss[2] += len(data)
             # if save_image and save_dir is not None:
-            
-            save_fn(
-                output,
-                os.path.join(epoch_dir, img_name[-1].replace(".npy", ".png")),
+            save_3ch_npy_to_img(
+                output, os.path.join(epoch_dir, img_name[-1].replace(".npy", ".png"))
             )
 
     dist.all_reduce(ddp_loss, op=dist.ReduceOp.SUM)
@@ -241,7 +258,9 @@ def test(
         print(msg)
         with open(os.path.join(save_dir, f"test.log"), "a") as f:
             f.write(f"Epoch {epoch}: {msg}\n")
-        wandb.log({"psnr": psnr_avg, "ssim": ssim_avg}, step=epoch)
+        wandb.log({"psnr": psnr_avg, "ssim": ssim_avg}, step=epoch + wandb_base_epoch)
+    # return average psnr
+    return ddp_loss[0] / ddp_loss[2]
 
 
 def load_states(experiment_name: str):
@@ -316,10 +335,9 @@ def fsdp_main(rank, world_size, opt):
     init_start_event = torch.cuda.Event(enable_timing=True)
     init_end_event = torch.cuda.Event(enable_timing=True)
 
-    num_res = opt.num_res
-    if num_res < 0:
-        num_res = 2 * opt.channels
-    model = ECFNet(in_nc=opt.channels, out_nc=opt.channels, num_res=num_res).to(rank)
+    model = DetachableECFNet(
+        in_nc=opt.channels, out_nc=opt.channels, level=opt.level_ablation
+    ).to(rank)
     # Activation Checkpoint Wrapper
     if opt.aggressive_checkpointing:
         blocks = [EBlock, DBlock, AFF1, AFF, SCM, FAM, SAM]
@@ -350,11 +368,15 @@ def fsdp_main(rank, world_size, opt):
     if rank == 0:
         wandb.init(
             project="ECFNet",
-            name=opt.experiment_name,
+            name=opt.wandb_name,
             id=opt.experiment_name,
-            group=str(opt.patch_size),
-            resume=None,
+            resume="Allowed",
         )
+    wandb_base_epoch = 0
+    if opt.patch_size == 512:
+        wandb_base_epoch = 1000
+    elif opt.patch_size == 800:
+        wandb_base_epoch = 1300
 
     save_path = Path(f"experiments/{opt.experiment_name}")
     save_dir_path = save_path.absolute()
@@ -370,7 +392,7 @@ def fsdp_main(rank, world_size, opt):
         found_state = load_states(opt.experiment_name)
         if found_state is not None:
             model_state, sched_state = found_state
-            start_epoch = model_state["current_epoch"] + 1
+            # start_epoch = model_state["current_epoch"] + 1
             print_root(rank, f"Resuming from previous state, epoch {start_epoch}")
     else:
         found_state = None
@@ -386,7 +408,7 @@ def fsdp_main(rank, world_size, opt):
         lr_scheduler.load_state_dict(sched_state)
         print_root(rank, f"Loaded previous state")
 
-    save_fn = setup_img_save_function(opt.channels)
+    best_value = -1
     init_start_event.record()
     for epoch in range(start_epoch, opt.num_epochs + 1):
         print_root(rank, f"Training at epoch {epoch}")
@@ -401,16 +423,18 @@ def fsdp_main(rank, world_size, opt):
             loss_lambda=opt.loss_lambda,
             sampler=train_sampler,
             loss_function=opt.loss_version,
+            wandb_base_epoch=wandb_base_epoch,
+            level=opt.level_ablation,
         )
         if epoch % opt.validation_interval == 0:
             print_root(rank, f"Testing at epoch {epoch}")
-            test(
+            curr_psnr = test(
                 model,
                 rank,
                 validation_loader,
                 epoch=epoch,
                 save_dir=save_dir_path,
-                save_fn=save_fn,
+                wandb_base_epoch=wandb_base_epoch,
             )
 
         if epoch % opt.save_interval == 0:
@@ -420,11 +444,11 @@ def fsdp_main(rank, world_size, opt):
             with FSDP.state_dict_type(
                 model, StateDictType.FULL_STATE_DICT, save_policy
             ):
-                cpu_state = model.state_dict()
-                cpu_lr_scheduler = lr_scheduler.state_dict()
-
+                cpu_state = model.module.state_dict()
             if rank == 0:
-                cpu_state["current_epoch"] = epoch
+                for key in cpu_state:
+                    cpu_state[key] = cpu_state[key].cpu()
+                cpu_lr_scheduler = lr_scheduler.state_dict()
                 torch.save(
                     cpu_state,
                     os.path.join(save_path, f"model_epoch_{epoch:03}.pth"),
@@ -438,6 +462,13 @@ def fsdp_main(rank, world_size, opt):
                     cpu_lr_scheduler,
                     os.path.join(save_path, f"lr_scheduler_latest.pth"),
                 )
+                if curr_psnr > best_value:
+                    best_value = curr_psnr
+                    torch.save(
+                        cpu_state,
+                        os.path.join(save_path, f"model_best.pth"),
+                    )
+                    print_root(rank, f"Saved best model at epoch {epoch}")
 
             dist.barrier()
         lr_scheduler.step()
@@ -481,8 +512,11 @@ def main():
     train_group.add_argument("--lr", type=float, default=8 * 1e-6)
     train_group.add_argument("--patch-size", type=int, default=800)
     train_group.add_argument("--loss-lambda", type=float, default=0.5)
-    train_group.add_argument("--num-res", type=int, default=-1)
+    train_group.add_argument("--num-res", type=int, default=6)
     train_group.add_argument("--loss-version", type=str, default="v1")
+    train_group.add_argument(
+        "--level-ablation", type=int, required=True, choices=[1, 2, 3]
+    )
 
     trainer_group = parser.add_argument_group("Trainer Options")
     trainer_group.add_argument("--num-workers", type=int, default=8)
@@ -498,6 +532,7 @@ def main():
     load_group = parser.add_argument_group("Experiment Loading")
     load_group.add_argument("--auto-resume", action="store_true")
     load_group.add_argument("--pretrained-model", type=str)
+    load_group.add_argument("--wandb-name", type=str, required=True)
 
     args = parser.parse_args()
 

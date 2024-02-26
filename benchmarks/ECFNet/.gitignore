@@ -10,3 +10,8 @@ logs
 
 *.sh
 *.sbatch
+
+experiments/
+experiments
+wandb
+wandb/

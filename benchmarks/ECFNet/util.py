@@ -8,7 +8,7 @@ from PIL import Image
 def save_4ch_npy_to_img(
     img_ts: torch.Tensor,
     img_path: str,
-    dng_info="../../background.dng",
+    dng_info="/home/n2/chanwoo/UDC/cvpr_rebuttal/UDC-SIT/dataset/background.dng",
 ):
     if dng_info is None:
         raise RuntimeError(
@@ -70,12 +70,11 @@ def save_3ch_npy_to_img(tensor: torch.Tensor, img_path: str):
 
 
 def setup_img_save_function(channels: int):
-    global img_save_function
     if channels == 3:
-        print("Setting up 3 channel image save function")
+        # print("Setting up 3 channel image save function")
         return save_3ch_npy_to_img
     elif channels == 4:
-        print("Setting up 4 channel image save function")
+        # print("Setting up 4 channel image save function")
         return save_4ch_npy_to_img
     else:
         raise ValueError("Channels must be 3 or 4")

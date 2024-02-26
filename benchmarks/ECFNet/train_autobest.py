@@ -34,13 +34,13 @@ from pathlib import Path
 import tqdm
 
 from networks.ECFNet import *
+from util import setup_img_save_function
 from datasets.dataset_pairs_npy import *
 from torchmetrics.functional import (
     peak_signal_noise_ratio,
     structural_similarity_index_measure,
 )
 import numpy as np
-from utils import setup_img_save_function
 from PIL import Image
 import wandb
 
@@ -128,8 +128,8 @@ def ecfnet_loss_v3(lq, gt, ratio=0.5, eps=1e-8):
     return charbonnier_loss + ratio * fft_abs
 
 
-def charbonnier_only(lq, gt, ratio=0.5, eps=1e-8):
-    return torch.sqrt(torch.mean((lq - gt) ** 2) + eps)
+def charbonnier_loss(lq, gt, ratio=0.5, eps=1e-8):
+    return torch.sqrt(torch.sum((lq - gt) ** 2) + eps)
 
 
 def ensemble_loss(lqs, gts, ratio=0.5, eps=1e-12, fn=ecfnet_loss):
@@ -143,7 +143,7 @@ loss_fn_map = {
     "v1": ecfnet_loss,
     "v2": ecfnet_loss_v2,
     "v3": ecfnet_loss_v3,
-    "charbonnier": charbonnier_only,
+    "charbonnier": charbonnier_loss,
 }
 
 
@@ -158,6 +158,7 @@ def train(
     loss_lambda=0.5,
     sampler=None,
     loss_function="v1",
+    wandb_base_epoch=0,
 ):
     model.train()
     ddp_loss = torch.zeros(2).to(rank)
@@ -187,7 +188,7 @@ def train(
     if rank == 0:
         avg_loss = ddp_loss[0] / ddp_loss[1]
         msg = "Train Epoch: {} \tLoss: {:.6f}".format(epoch, avg_loss)
-        wandb.log({"train loss": avg_loss}, step=epoch)
+        wandb.log({"train loss": avg_loss}, step=epoch + wandb_base_epoch)
         print(msg)
         with open(os.path.join(save_dir_path, f"train.log"), "a") as f:
             f.write(f"Epoch {epoch}: {msg}\n")
@@ -201,10 +202,11 @@ def test(
     model: nn.Module,
     rank: int,
     test_loader: DataLoader,
-    save_image=False,
     save_dir=None,
     epoch=None,
+    wandb_base_epoch=0,
     save_fn=save_3ch_npy_to_img,
+    save_count=0,
 ):
     model.eval()
     ddp_loss = torch.zeros(3).to(rank)
@@ -224,11 +226,11 @@ def test(
             ddp_loss[1] += structural_similarity_index_measure(output, target)
             ddp_loss[2] += len(data)
             # if save_image and save_dir is not None:
-            
-            save_fn(
-                output,
-                os.path.join(epoch_dir, img_name[-1].replace(".npy", ".png")),
-            )
+            if save_count > 0:
+                save_fn(
+                    output,
+                    os.path.join(epoch_dir, img_name[-1].replace(".npy", ".png")),
+                )
 
     dist.all_reduce(ddp_loss, op=dist.ReduceOp.SUM)
 
@@ -241,7 +243,9 @@ def test(
         print(msg)
         with open(os.path.join(save_dir, f"test.log"), "a") as f:
             f.write(f"Epoch {epoch}: {msg}\n")
-        wandb.log({"psnr": psnr_avg, "ssim": ssim_avg}, step=epoch)
+        wandb.log({"psnr": psnr_avg, "ssim": ssim_avg}, step=epoch + wandb_base_epoch)
+    # return average psnr
+    return ddp_loss[0] / ddp_loss[2]
 
 
 def load_states(experiment_name: str):
@@ -268,7 +272,12 @@ def fsdp_main(rank, world_size, opt):
     print_root(rank, f"Running on rank {rank} of {world_size}")
 
     train_dataset = my_dataset(
-        opt.train_input, opt.train_gt, mapping=opt.mapping, crop_size=opt.patch_size
+        opt.train_input,
+        opt.train_gt,
+        mapping=opt.mapping,
+        crop_size=opt.patch_size,
+        backend=opt.backend,
+        map_range=opt.norm_range,
     )
     print_root(rank, f"Training dataset path: {opt.train_input}")
     if opt.limit_train_batches > 1:
@@ -279,7 +288,13 @@ def fsdp_main(rank, world_size, opt):
     else:
         print_root(rank, f"Training dataset size: {len(train_dataset)}")
 
-    validation_dataset = my_dataset_eval(opt.val_input, opt.val_gt, mapping=opt.mapping)
+    validation_dataset = my_dataset_eval(
+        opt.val_input,
+        opt.val_gt,
+        mapping=opt.mapping,
+        backend=opt.backend,
+        map_range=opt.norm_range,
+    )
     print_root(rank, f"Validation dataset path: {opt.val_input}")
     if opt.limit_val_batches > 1:
         validation_dataset = Subset(
@@ -318,7 +333,7 @@ def fsdp_main(rank, world_size, opt):
 
     num_res = opt.num_res
     if num_res < 0:
-        num_res = 2 * opt.channels
+        num_res = opt.channels * 2
     model = ECFNet(in_nc=opt.channels, out_nc=opt.channels, num_res=num_res).to(rank)
     # Activation Checkpoint Wrapper
     if opt.aggressive_checkpointing:
@@ -350,11 +365,19 @@ def fsdp_main(rank, world_size, opt):
     if rank == 0:
         wandb.init(
             project="ECFNet",
-            name=opt.experiment_name,
+            name=opt.wandb_name,
             id=opt.experiment_name,
-            group=str(opt.patch_size),
-            resume=None,
+            resume="Allowed",
         )
+
+    wandb_base_epoch = opt.wandb_epoch
+    if wandb_base_epoch < 0:
+        if opt.patch_size == 256:
+            wandb_base_epoch = 0
+        elif opt.patch_size == 512:
+            wandb_base_epoch = 1000
+        elif opt.patch_size == 800:
+            wandb_base_epoch = 1300
 
     save_path = Path(f"experiments/{opt.experiment_name}")
     save_dir_path = save_path.absolute()
@@ -370,7 +393,7 @@ def fsdp_main(rank, world_size, opt):
         found_state = load_states(opt.experiment_name)
         if found_state is not None:
             model_state, sched_state = found_state
-            start_epoch = model_state["current_epoch"] + 1
+            # start_epoch = model_state["current_epoch"] + 1
             print_root(rank, f"Resuming from previous state, epoch {start_epoch}")
     else:
         found_state = None
@@ -386,6 +409,7 @@ def fsdp_main(rank, world_size, opt):
         lr_scheduler.load_state_dict(sched_state)
         print_root(rank, f"Loaded previous state")
 
+    best_value = -1
     save_fn = setup_img_save_function(opt.channels)
     init_start_event.record()
     for epoch in range(start_epoch, opt.num_epochs + 1):
@@ -401,16 +425,18 @@ def fsdp_main(rank, world_size, opt):
             loss_lambda=opt.loss_lambda,
             sampler=train_sampler,
             loss_function=opt.loss_version,
+            wandb_base_epoch=wandb_base_epoch,
         )
         if epoch % opt.validation_interval == 0:
             print_root(rank, f"Testing at epoch {epoch}")
-            test(
+            curr_psnr = test(
                 model,
                 rank,
                 validation_loader,
                 epoch=epoch,
                 save_dir=save_dir_path,
-                save_fn=save_fn,
+                wandb_base_epoch=wandb_base_epoch,
+                save_count=opt.save_img_count,
             )
 
         if epoch % opt.save_interval == 0:
@@ -420,11 +446,11 @@ def fsdp_main(rank, world_size, opt):
             with FSDP.state_dict_type(
                 model, StateDictType.FULL_STATE_DICT, save_policy
             ):
-                cpu_state = model.state_dict()
-                cpu_lr_scheduler = lr_scheduler.state_dict()
-
+                cpu_state = model.module.state_dict()
             if rank == 0:
-                cpu_state["current_epoch"] = epoch
+                for key in cpu_state:
+                    cpu_state[key] = cpu_state[key].cpu()
+                cpu_lr_scheduler = lr_scheduler.state_dict()
                 torch.save(
                     cpu_state,
                     os.path.join(save_path, f"model_epoch_{epoch:03}.pth"),
@@ -438,6 +464,13 @@ def fsdp_main(rank, world_size, opt):
                     cpu_lr_scheduler,
                     os.path.join(save_path, f"lr_scheduler_latest.pth"),
                 )
+                if curr_psnr > best_value:
+                    best_value = curr_psnr
+                    torch.save(
+                        cpu_state,
+                        os.path.join(save_path, f"model_best.pth"),
+                    )
+                    print_root(rank, f"Saved best model at epoch {epoch}")
 
             dist.barrier()
         lr_scheduler.step()
@@ -473,6 +506,7 @@ def main():
     data_group.add_argument(
         "--mapping", type=str, default="tonemap", choices=["tonemap", "norm"]
     )
+    data_group.add_argument("--norm-range", type=int, default=1024)
     data_group.add_argument("--channels", type=int, default=3)
 
     train_group = parser.add_argument_group("Training Options")
@@ -490,14 +524,18 @@ def main():
     trainer_group.add_argument("--limit-train-batches", type=int, default=1.0)
     trainer_group.add_argument("--limit-val-batches", type=int, default=1.0)
     trainer_group.add_argument("--aggressive-checkpointing", action="store_true")
+    trainer_group.add_argument("--backend", type=str, default="npy")
 
     saving_group = parser.add_argument_group("Experiment Saving")
     saving_group.add_argument("--experiment-name", type=str, default="ECFNet")
     saving_group.add_argument("--save-interval", type=int, default=15)
+    saving_group.add_argument("--save-img-count", type=int, default=360)
 
     load_group = parser.add_argument_group("Experiment Loading")
     load_group.add_argument("--auto-resume", action="store_true")
     load_group.add_argument("--pretrained-model", type=str)
+    load_group.add_argument("--wandb-name", type=str, required=True)
+    load_group.add_argument("--wandb-epoch", type=int, default=-1)
 
     args = parser.parse_args()
 

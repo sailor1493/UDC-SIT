@@ -17,6 +17,7 @@ import logging
 from networks.ECFNet import *
 from datasets.dataset_pairs_npy import my_dataset_eval
 from util import setup_img_save_function
+import numpy as np
 
 img_save_function = None
 
@@ -31,6 +32,20 @@ def calculate_lfd_lpd(lq, gt):
     lpd_value = torch.log(lpd_sum_vector.mean() + 1)
 
     return lfd_value, lpd_value
+
+
+def manual_psnr(img1, img2, data_range=255.0):
+    # change to 0-255, int8 tensor
+    # img1 = img1 * 255
+    # img2 = img2 * 255
+    # img1 = img1.to(torch.uint8).to(torch.float32)
+    # img2 = img2.to(torch.uint8).to(torch.float32)
+
+    # calculate mse
+    mse = torch.mean((img1 - img2) ** 2)
+    if mse == 0:
+        return 100
+    return 20 * torch.log10(data_range / torch.sqrt(mse))
 
 
 def test(
@@ -57,11 +72,20 @@ def test(
 
             data, target = data.to(0), target.to(0)
             output = model(data)
+            # output = data
             # if ouptut is list, take only the last one
             if isinstance(output, list):
                 output = output[-1]
+
+            # This is the difference between 54.29 and 52.17
             output = torch.clamp(output, 0, 1)
-            psnr = peak_signal_noise_ratio(output, target)
+            output_img = output.clone()
+            output = output * 255
+            target = target * 255
+            output = output.to(torch.uint8).to(torch.float32)
+            target = target.to(torch.uint8).to(torch.float32)
+
+            psnr = manual_psnr(output, target, data_range=255.0)
             ddp_loss[0] += psnr
             ssim = structural_similarity_index_measure(output, target)
             ddp_loss[1] += ssim
@@ -79,9 +103,9 @@ def test(
 
             if save_image and save_dir is not None:
                 filename = f"{experiment_name}_{img_name}.png"
-                img_save_function(output, os.path.join(save_dir, filename))
-                filename = f"{experiment_name}_{img_name}_input.png"
-                img_save_function(data, os.path.join(save_dir, filename))
+                img_save_function(output_img, os.path.join(save_dir, filename))
+                # filename = f"{experiment_name}_{img_name}_input.png"
+                # img_save_function(data, os.path.join(save_dir, filename))
     msg = f"Test set: Average PSNR: {ddp_loss[0] / ddp_loss[2]:.4f}, Average SSIM: {ddp_loss[1] / ddp_loss[2]:.4f}"
     if logger is not None:
         logger.info(msg)
@@ -101,6 +125,7 @@ def main():
     parser.add_argument("--norm", type=str, required=True, choices=["norm", "tonemap"])
     parser.add_argument("--data-itself", action="store_true")
     parser.add_argument("--num-res", type=int, default=6)
+    parser.add_argument("--no-save-image", action="store_false")
     args = parser.parse_args()
 
     print("Creating test dataset...", end=" ", flush=True)
@@ -151,7 +176,7 @@ def main():
     test(
         model,
         test_loader,
-        save_image=True,
+        save_image=args.no_save_image,
         save_dir=save_dir,
         experiment_name=args.name,
         logger=logger,
