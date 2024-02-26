@@ -45,32 +45,6 @@ from PIL import Image
 import wandb
 
 
-def save_3ch_npy_to_img(tensor: torch.Tensor, img_path: str):
-    # squeeze
-    tensor = tensor.squeeze(0)
-
-    # Convert PyTorch tensor to NumPy array
-    numpy_array = tensor.cpu().numpy()
-
-    # Normalize and convert to uint8 type
-    minimum = numpy_array.min()
-    maximum = numpy_array.max()
-    delta = maximum - minimum
-    if delta < 1e-6:
-        delta = 1
-    normalized_array = (numpy_array - minimum) / delta
-
-    # Convert to uint8 type. Input: 3 channel, output: 3 channel
-    uint8_array = (normalized_array * 255.0).astype(np.uint8)
-    uint8_array = np.transpose(uint8_array, (1, 2, 0))
-
-    # Convert NumPy array to PIL Image
-    pil_image = Image.fromarray(uint8_array, mode="RGB")
-
-    # Save PIL Image as PNG
-    pil_image.save(img_path)
-
-
 def print_root(rank, msg):
     if rank == 0:
         print(msg)
@@ -205,7 +179,7 @@ def test(
     save_dir=None,
     epoch=None,
     wandb_base_epoch=0,
-    save_fn=save_3ch_npy_to_img,
+    save_fn=None,
     save_count=0,
 ):
     model.eval()
@@ -437,6 +411,7 @@ def fsdp_main(rank, world_size, opt):
                 save_dir=save_dir_path,
                 wandb_base_epoch=wandb_base_epoch,
                 save_count=opt.save_img_count,
+                save_fn=save_fn,
             )
 
         if epoch % opt.save_interval == 0:
