@@ -358,7 +358,11 @@ def fsdp_main(rank, world_size, opt):
     init_end_event = torch.cuda.Event(enable_timing=True)
 
     model = IntensifiedECFNet(
-        in_nc=opt.channels, out_nc=opt.channels, level=opt.level_ablation
+        in_nc=opt.channels,
+        out_nc=opt.channels,
+        level=opt.level_ablation,
+        num_res=opt.num_res,
+        base_channel=opt.base_channel,
     ).to(rank)
     # Activation Checkpoint Wrapper
     if opt.aggressive_checkpointing:
@@ -548,6 +552,7 @@ def main():
     train_group.add_argument(
         "--level-ablation", type=int, required=True, choices=[1, 2, 3, 4, 5, 6]
     )
+    train_group.add_argument("--base-channel", type=int)
 
     trainer_group = parser.add_argument_group("Trainer Options")
     trainer_group.add_argument("--num-workers", type=int, default=8)
@@ -555,6 +560,7 @@ def main():
     trainer_group.add_argument("--limit-train-batches", type=int, default=1.0)
     trainer_group.add_argument("--limit-val-batches", type=int, default=1.0)
     trainer_group.add_argument("--aggressive-checkpointing", action="store_true")
+    trainer_group.add_argument("--num-gpu", type=int, default=4)
 
     saving_group = parser.add_argument_group("Experiment Saving")
     saving_group.add_argument("--experiment-name", type=str, default="ECFNet")
@@ -568,11 +574,28 @@ def main():
 
     args = parser.parse_args()
 
+    msg = f"""
+    Running with the following options:
+    Train input: {args.train_input}
+    Train gt: {args.train_gt}
+    Val input: {args.val_input}
+    Val gt: {args.val_gt}
+    
+    GPU Count: {args.num_gpu}
+    Batch size: {args.batch_size}
+    Num epochs: {args.num_epochs}
+    
+    
+    num_res: {args.num_res}
+    base_channel: {args.base_channel}
+    """
+    print(msg)
+
     torch.manual_seed(42)
     # torch.set_float32_matmul_precision("medium")
     torch.set_float32_matmul_precision("highest")
 
-    WORLD_SIZE = 4  # in our case, we have 4 GPUs
+    WORLD_SIZE = args.num_gpu  # in our case, we have 4 GPUs
     # WORLD_SIZE = torch.cuda.device_count()
 
     mp.spawn(fsdp_main, args=(WORLD_SIZE, args), nprocs=WORLD_SIZE, join=True)

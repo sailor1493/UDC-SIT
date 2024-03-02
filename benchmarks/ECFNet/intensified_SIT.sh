@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name v2-level3
+#SBATCH --job-name ;5
 #SBATCH --partition chanwoo
 #SBATCH --output logs/%j.log
 #SBATCH --error logs/%j.err
@@ -41,7 +41,7 @@ train_gt="$base_dir/training/GT"
 val_input="$base_dir/validation/input"
 val_gt="$base_dir/validation/GT"
 
-level=5
+level=6
 wandb_name="mi100-intensified-level$level-develop"
 step_1="${wandb_name}-1"
 step_2="${wandb_name}-2"

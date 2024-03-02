@@ -219,13 +219,14 @@ class SAM(nn.Module):
 class IntensifiedECFNet(nn.Module):
     AFF_CONSTANTS = [1, 3, 7, 15, 31, 63]
 
-    def __init__(self, in_nc=3, out_nc=3, base_channel=None, level=4):
+    def __init__(self, in_nc=3, out_nc=3, base_channel=None, level=4, num_res=None):
         super(IntensifiedECFNet, self).__init__()
         if level not in [1, 2, 3, 4, 5, 6]:
             raise NotImplementedError("Use original ECFNet")
 
         base_channel = in_nc * 8 if base_channel is None else base_channel
-        num_res = 2 * in_nc
+        if num_res is None:
+            num_res = 2 * in_nc
         self.level = level
 
         input_feat_extracts = [
