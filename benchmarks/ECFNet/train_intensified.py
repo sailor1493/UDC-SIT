@@ -223,6 +223,56 @@ def save_image(output, save_path):
     print(f"Saving image to {save_path}")
 
 
+def crop_and_forward(data, model, w_div=2, h_div=2, pad_size=128):
+    """
+    Crop the data for 4 by 4 patches and forward it through the model
+    All size divisible by 64, and overlap by pad_size pixels
+    1792 1280 -> 448 + 64
+    """
+    B, C, H, W = data.shape
+    dev = data.device
+
+    h_step = H // h_div
+    w_step = W // w_div
+
+    hs = []
+    for i in range(h_div + 1):
+        hs.append(i * h_step)
+    ws = []
+    for j in range(h_div + 1):
+        ws.append(j * w_step)
+
+    out_patch = torch.zeros((B, C, H, W), device=dev)
+    for i in range(w_div):
+        for j in range(h_div):
+            left_target = ws[i] - pad_size
+            right_target = ws[i + 1] + pad_size
+            top_target = hs[j] - pad_size
+            bottom_target = hs[j + 1] + pad_size
+            left = left_target if left_target > 0 else 0
+            left_pad = pad_size if left_target > 0 else 0
+            right = right_target if right_target < W else W
+            right_pad = pad_size if right_target < W else 0
+            top = top_target if top_target > 0 else 0
+            top_pad = pad_size if top_target > 0 else 0
+            bottom = bottom_target if bottom_target < H else H
+            bottom_pad = pad_size if bottom_target < H else 0
+            in_patch = data[:, :, top:bottom, left:right]
+            # print("i, j, top, bottom, left, right: ", i, j, top, bottom, left, right)
+            # print("Paddings: ", top_pad, bottom_pad, left_pad, right_pad)
+            patch = model(in_patch)[0][
+                :,
+                :,
+                top_pad : h_step + top_pad,
+                left_pad : w_step + left_pad,
+            ]
+            # print("patch: ", patch.shape)
+            # print("data shape: ", data.shape)
+            # print("in patch shape: ", in_patch.shape)
+            out_patch[:, :, hs[j] : hs[j + 1], ws[i] : ws[i + 1]] = patch
+    return out_patch
+
+
 def test(
     model: nn.Module,
     rank: int,
@@ -246,11 +296,13 @@ def test(
     with torch.no_grad():
         for data, target, img_name in iter_bar:
             data, target = data.to(rank), target.to(rank)
-            output = model(data)
+            # output = model(data)
+            output = crop_and_forward(data, model)
             # if ouptut is list, take only the last one
             if isinstance(output, list):
                 output = output[0]
 
+            img = output.clone()
             output = output * 255
             target = target * 255
             output = output.to(torch.uint8).to(torch.float32)
@@ -262,7 +314,7 @@ def test(
             # if save_image and save_dir is not None:
             if save:
                 save_fn(
-                    output,
+                    img,
                     os.path.join(epoch_dir, img_name[-1].replace(".npy", ".png")),
                 )
                 remaining -= 1
@@ -350,7 +402,7 @@ def fsdp_main(rank, world_size, opt):
     print_root(rank, f"Created validation loader")
 
     my_auto_wrap_policy = functools.partial(
-        size_based_auto_wrap_policy, min_num_params=128
+        size_based_auto_wrap_policy, min_num_params=1
     )
     torch.cuda.set_device(rank)
 
@@ -525,7 +577,7 @@ def fsdp_main(rank, world_size, opt):
                 states,
                 os.path.join(save_path, f"model_final.pth"),
             )
-
+    dist.barrier()
     cleanup()
 
 
@@ -574,8 +626,7 @@ def main():
 
     args = parser.parse_args()
 
-    msg = f"""
-    Running with the following options:
+    msg = f"""Running with the following options:
     Train input: {args.train_input}
     Train gt: {args.train_gt}
     Val input: {args.val_input}
@@ -584,7 +635,6 @@ def main():
     GPU Count: {args.num_gpu}
     Batch size: {args.batch_size}
     Num epochs: {args.num_epochs}
-    
     
     num_res: {args.num_res}
     base_channel: {args.base_channel}
